@@ -27,7 +27,7 @@ app = Flask(__name__)
 
 import os
 import dotenv
-dotenv.load_dotenv()
+dotenv.load_dotenv("env/.env")
 
 configuration = Configuration(access_token=os.getenv("CHANNEL_ACCESS_TOKEN"))
 handler = WebhookHandler(os.getenv("CHANNEL_SECRET"))
@@ -66,4 +66,5 @@ def handle_message(event):
         )
 
 if __name__ == "__main__":
+
     app.run()
