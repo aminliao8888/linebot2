@@ -1,0 +1,173 @@
+name: Deploy Line Bot to GCE (clean)
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - "**/*.py"
+      - "requirements.txt"
+      - "uwsgi.ini"
+      - ".github/workflows/deploy-gce.yml"
+  workflow_dispatch:
+    inputs:
+      do_pip_install:
+        description: "部署後在 GCE 的 venv 內執行 pip install -r requirements.txt"
+        type: boolean
+        required: false
+        default: false
+
+concurrency:
+  group: deploy-linebot
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    env:
+      # === 基本連線與部署參數 ===
+      GCE_HOST: ${{ secrets.GCE_HOST }}                         # 例：35.xx.xx.xx
+      GCE_USER: ${{ secrets.GCE_USER }}                         # 例：Amin（大小寫要一致）
+      DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}                   # 例：/home/Amin（建議 secrets 不帶尾斜線）
+      LINE_BOT_AP_DIR: ${{ format('{0}/linebot', secrets.DEPLOY_PATH) }}
+      SERVICE_NAME: ${{ secrets.SERVICE_NAME }}                 # 例：modelserver
+      ENV_DIR: ${{ format('{0}/linebot/env', secrets.DEPLOY_PATH) }}
+
+      # === Line Bot secrets ===
+      CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
+      CHANNEL_SECRET: ${{ secrets.LINE_CHANNEL_SECRET }}
+
+      # === 共用 SSH 選項，避免重複 ===
+      SSH_OPTS: >-
+        -o IdentitiesOnly=yes
+        -o PreferredAuthentications=publickey
+        -o PasswordAuthentication=no
+        -o KbdInteractiveAuthentication=no
+        -o GSSAPIAuthentication=no
+        -o StrictHostKeyChecking=yes
+        -i ~/.ssh/id_ed25519
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Prepare SSH (ed25519)
+        shell: bash
+        run: |
+          set -euo pipefail
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          # 預先加入 host key，避免 StrictHostKeyChecking 卡住
+          ssh-keyscan -H -t rsa,ed25519 "$GCE_HOST" >> ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+
+      - name: Show CI public key (for GCE metadata cross-check)
+        shell: bash
+        run: |
+          ssh-keygen -y -f ~/.ssh/id_ed25519
+
+      - name: Smoke test SSH
+        shell: bash
+        run: |
+          set -x
+          ssh $SSH_OPTS "${GCE_USER}@${GCE_HOST}" "whoami && echo \$HOME"
+
+      - name: Ensure remote deploy path exists (mkdir/chown/chmod)
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh $SSH_OPTS "${GCE_USER}@${GCE_HOST}" \
+            "set -euo pipefail; \
+             install -d -m 755 '${LINE_BOT_AP_DIR}'; \
+             sudo -n chown -R \$USER:\$USER '${LINE_BOT_AP_DIR}' || true"
+
+      - name: Rsync code to GCE (repo root → LINE_BOT_AP_DIR)
+        shell: bash
+        run: |
+          set -euo pipefail
+          rsync -vrtz --delete \
+            --exclude '.git/' \
+            --exclude '.github/' \
+            --exclude '.gitignore' \
+            --no-owner --no-group --omit-dir-times --no-perms \
+            -e "ssh $SSH_OPTS" \
+            ./ "${GCE_USER}@${GCE_HOST}:${LINE_BOT_AP_DIR}"
+
+      - name: Push LINE .env to ${ENV_DIR} on GCE
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+
+          # 1) 產生本機 .env（LF 換行、600 權限）
+          printf 'CHANNEL_ACCESS_TOKEN=%s\nCHANNEL_SECRET=%s\n' \
+            "$CHANNEL_ACCESS_TOKEN" "$CHANNEL_SECRET" > .env
+          chmod 600 .env
+
+          # 2) 遠端建立 env 目錄並寫入 .env
+          ssh $SSH_OPTS "${GCE_USER}@${GCE_HOST}" \
+            "set -euo pipefail; \
+             install -d -m 700 '${ENV_DIR}'; \
+             install -m 600 /dev/stdin '${ENV_DIR}/.env'" < .env
+
+          # 3) 驗證（不印內容，僅列檔案資訊與雜湊）
+          ssh $SSH_OPTS "${GCE_USER}@${GCE_HOST}" \
+            "set -euo pipefail; \
+             test -s '${ENV_DIR}/.env'; \
+             ls -l '${ENV_DIR}/.env'; \
+             command -v sha256sum >/dev/null 2>&1 && sha256sum '${ENV_DIR}/.env' || echo 'sha256sum not found; skip hash'; \
+             echo 'REMOTE HOME='\"\$HOME\""
+
+          # 4) 清理本機檔
+          rm -f .env
+
+      - name: Install dependencies on VM (venv, optional)
+        if: ${{ fromJSON(inputs.do_pip_install || 'false') }}
+        shell: bash
+        run: |
+          ssh $SSH_OPTS "${GCE_USER}@${GCE_HOST}" "
+            set -e
+            cd '${LINE_BOT_AP_DIR}'
+            [ -d venv ] || python3 -m venv venv
+            . venv/bin/activate
+            pip install --upgrade pip wheel
+            [ -f requirements.txt ] && pip install -r requirements.txt || true
+          "
+
+      - name: Restart service on VM (wait until active + logs if fail)
+        shell: bash
+        run: |
+          set -euo pipefail
+          U=$(printf '%s' "${GCE_USER}" | tr -d '\r\n' | xargs)
+          H=$(printf '%s' "${GCE_HOST}" | tr -d '\r\n' | xargs)
+          SVC=$(printf '%s' "${SERVICE_NAME}" | tr -d '\r\n' | xargs)
+
+          ssh $SSH_OPTS -l "$U" -- "$H" "bash -s -- $(printf %q "$SVC")" <<'REMOTE'
+          set -euo pipefail
+          SERVICE_NAME="$1"
+
+          sudo -n systemctl daemon-reload || true
+          sudo -n systemctl restart "$SERVICE_NAME"
+
+          # 等待 active / failed，最長 300 秒
+          for i in {1..300}; do
+            state=$(sudo -n systemctl is-active "$SERVICE_NAME" || true)
+            echo "state=$state"
+            if [ "$state" = "active" ]; then
+              sudo -n systemctl --no-pager -l status "$SERVICE_NAME" || true
+              exit 0
+            fi
+            if [ "$state" = "failed" ]; then
+              sudo -n systemctl --no-pager -l status "$SERVICE_NAME" || true
+              sudo -n journalctl -u "$SERVICE_NAME" -n 200 --no-pager || true
+              exit 1
+            fi
+            sleep 1
+          done
+
+          echo 'Timed out waiting for service to become active'
+          sudo -n systemctl --no-pager -l status "$SERVICE_NAME" || true
+          sudo -n journalctl -u "$SERVICE_NAME" -n 200 --no-pager || true
+          exit 1
+          REMOTE
